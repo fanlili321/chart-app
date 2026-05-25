@@ -1,0 +1,8 @@
+*.xlsx
+*.xls
+*.csv
+*.png
+*.zip
+__pycache__/
+.DS_Store
+chart_app_backup_*.py
