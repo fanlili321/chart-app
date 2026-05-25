@@ -31,7 +31,7 @@ COLOR_NAMES = {
     "#C8A028": "⑦ 金黄  #C8A028",
 }
 
-st.set_page_config(page_title="银行螺丝钉 指数走势生成器", layout="wide", page_icon="📈")
+st.set_page_config(page_title="银行螺丝钉 ppt图表生成器", layout="wide", page_icon="📈")
 st.markdown("""
 <style>
 /* ── 整体容器 ─────────────────────────────────────────────── */
@@ -605,7 +605,7 @@ st.markdown("""
   </div>
   <div style="color:#fff;font-size:24px;font-weight:700;
               letter-spacing:.5px;margin-bottom:8px;">
-    银行螺丝钉 &nbsp;指数走势生成器
+    银行螺丝钉 &nbsp;ppt图表生成器
   </div>
   <div style="color:rgba(255,255,255,.5);font-size:13px;line-height:1.8;">
     上传 Excel 多子表数据 &nbsp;·&nbsp; 逐图配置参数 &nbsp;·&nbsp; 一键生成专业走势图
