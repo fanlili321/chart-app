@@ -106,124 +106,174 @@ div[data-testid="stAlert"] { border-radius: 10px !important; }
 
 # ── 数据复核 ────────────────────────────────────────────────────────
 
-def render_data_check(sheets: dict):
+def _detect_spikes(s: pd.Series) -> list[int]:
     """
-    数据复核：直接展示原始数据，让用户自行核查。
-    - 每个子表单独一个标签页，完整显示数据表格
-    - 若多个子表存在同名列，额外显示"跨表对比"标签页，
-      将同名列并排展示，差异一目了然
+    用 MAD（中位绝对偏差）检测突变点。
+    做法：先算每期变化量，再算变化量的 MAD；
+    某期变化量偏离中位变化量超过 5 倍 MAD，且绝对变化 > 数值量级 5%，才标记。
+    这样对趋势性涨跌不敏感，只抓真正的"跳点"。
     """
-    sheet_names = list(sheets.keys())
+    if len(s) < 6:
+        return []
+    changes = s.diff().dropna()
+    med_chg = changes.median()                       # 中位变化量（捕捉趋势方向）
+    mad     = (changes - med_chg).abs().median()     # 中位绝对偏差
+    if mad < 1e-10:
+        return []
+    scale   = s.abs().median()
+    spikes  = []
+    for i, (idx, chg) in enumerate(changes.items()):
+        if abs(chg - med_chg) > 5 * mad and abs(chg) > scale * 0.05:
+            # i+1 对应 s 中的位置（diff 从第1期开始）
+            spikes.append(i + 1)
+    return spikes
 
-    # 找出在多个子表中都出现的列名（用于跨表对比）
-    col_to_sheets: dict[str, list[str]] = {}
-    sheet_parsed: dict[str, tuple] = {}   # sn -> (date_col, value_cols, df_indexed)
+
+def _spike_chart(s: pd.Series, spike_idxs: list[int], title: str):
+    """画带红点标记的小折线图，spike_idxs 是要高亮的行号（在 s 中的位置）。"""
+    fig, ax = plt.subplots(figsize=(7, 2.2), dpi=100)
+    ax.plot(range(len(s)), s.values, color="#4C8BBF", linewidth=1.5, zorder=2)
+    for i in spike_idxs:
+        ax.scatter(i, s.iloc[i], color="#E03E3E", s=60, zorder=3)
+    ax.set_title(title, fontsize=9, pad=4)
+    ax.tick_params(axis="both", labelsize=7)
+    ax.set_xticks([0, len(s) // 2, len(s) - 1])
+    ax.set_xticklabels([
+        s.index[0].strftime("%Y-%m") if hasattr(s.index[0], "strftime") else str(s.index[0]),
+        s.index[len(s) // 2].strftime("%Y-%m") if hasattr(s.index[len(s) // 2], "strftime") else "",
+        s.index[-1].strftime("%Y-%m") if hasattr(s.index[-1], "strftime") else str(s.index[-1]),
+    ], fontsize=7)
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+    fig.tight_layout(pad=0.5)
+    return fig
+
+
+def render_data_check(sheets: dict):
+    """数据复核：自动检测突变 + 跨表不一致，以图表方式直观展示。"""
+    try:
+        _render_data_check_inner(sheets)
+    except Exception as e:
+        st.warning(f"数据复核模块出现错误（{e}），已跳过，可直接出图。")
+
+
+def _render_data_check_inner(sheets: dict):
+    # ── 准备：解析每个子表的日期列和数值列 ──────────────────────────
+    sheet_parsed = {}   # sn -> (date_col, value_cols)
+    col_to_sheets = {}  # col -> [sn, ...]
     for sn, df in sheets.items():
-        date_col, value_cols = detect_date_and_value_cols(df)
-        sheet_parsed[sn] = (date_col, value_cols or [])
-        for col in (value_cols or []):
+        dc, vc = detect_date_and_value_cols(df)
+        sheet_parsed[sn] = (dc, vc or [])
+        for col in (vc or []):
             col_to_sheets.setdefault(col, []).append(sn)
     shared_cols = {col: sns for col, sns in col_to_sheets.items() if len(sns) > 1}
 
-    # 构建标签页列表
-    tab_labels = [f"📋 {sn}" for sn in sheet_names]
-    if shared_cols:
-        tab_labels.append("🔍 跨表对比")
+    # ── 收集突变问题 ──────────────────────────────────────────────────
+    spike_issues = []   # (sheet, col, series, spike_idxs)
+    for sn, df in sheets.items():
+        dc, vc = sheet_parsed[sn]
+        if not dc or not vc:
+            continue
+        df_w = df.copy()
+        df_w["__d__"] = pd.to_datetime(df_w[dc], errors="coerce")
+        df_w = df_w.dropna(subset=["__d__"]).set_index("__d__").sort_index()
+        for col in vc:
+            s = pd.to_numeric(df_w[col], errors="coerce").dropna()
+            idxs = _detect_spikes(s)
+            if idxs:
+                spike_issues.append((sn, col, s, idxs))
 
-    tabs = st.tabs(tab_labels)
-
-    # ── 每个子表独立标签页 ──────────────────────────────────────────
-    for i, sn in enumerate(sheet_names):
-        df = sheets[sn]
-        date_col, value_cols = sheet_parsed[sn]
-
-        with tabs[i]:
-            st.caption(f"共 {len(df)} 行 · {len(df.columns)} 列")
-
-            if not date_col:
-                # 无法识别日期列，直接展示原始表
-                st.dataframe(df, use_container_width=True, hide_index=True)
+    # ── 收集跨表不一致 ────────────────────────────────────────────────
+    cross_issues = []   # (col, merged_df, diff_dates)
+    for col, sns in shared_cols.items():
+        merged = None
+        for sn in sns:
+            df = sheets[sn]
+            dc, vc = sheet_parsed[sn]
+            if not dc or col not in vc:
                 continue
+            sub = df[[dc, col]].copy()
+            sub[dc] = pd.to_datetime(sub[dc], errors="coerce")
+            sub = (sub.dropna(subset=[dc])
+                   .set_index(dc)[[col]]
+                   .rename(columns={col: sn}))
+            sub = sub[~sub.index.duplicated(keep="first")]
+            merged = sub if merged is None else merged.join(sub, how="inner")
+        if merged is None or len(merged.columns) < 2 or merged.empty:
+            continue
+        merged = merged.sort_index()
+        # 找出同日期数值差异 > 1% 的行
+        def row_diff(row):
+            v = row.dropna()
+            if len(v) < 2:
+                return 0.0
+            ref = max(abs(v).max(), 1e-10)
+            return (v.max() - v.min()) / ref
+        diff_mask = merged.apply(row_diff, axis=1) > 0.01
+        diff_dates = merged.index[diff_mask]
+        if len(diff_dates) > 0:
+            cross_issues.append((col, merged, diff_dates))
 
-            # 整理为以日期为首列的展示格式
-            display_df = df.copy()
-            try:
-                display_df[date_col] = pd.to_datetime(
-                    display_df[date_col], errors="coerce"
-                ).dt.strftime("%Y-%m-%d")
-            except Exception:
-                pass
+    # ── 汇总指标 ──────────────────────────────────────────────────────
+    c1, c2, c3 = st.columns(3)
+    c1.metric("📈 突变疑点", len(spike_issues), help="某期数值相比前后跳变明显")
+    c2.metric("🔀 跨表不一致", len(cross_issues), help="同名列在不同子表数值不同")
+    c3.metric("共检查子表", len(sheets))
 
-            # 数值列保留4位有效数字，便于阅读
-            for col in value_cols:
-                try:
-                    display_df[col] = pd.to_numeric(
-                        display_df[col], errors="coerce"
-                    ).round(4)
-                except Exception:
-                    pass
+    if not spike_issues and not cross_issues:
+        st.success("✅ 未发现明显数据异常，可以直接出图。")
+        return
 
-            st.dataframe(
-                display_df,
-                use_container_width=True,
-                hide_index=True,
-                height=min(520, (len(display_df) + 1) * 35 + 50),
-            )
+    # ── 展示突变 ──────────────────────────────────────────────────────
+    if spike_issues:
+        with st.expander(f"📈 数据突变疑点（共 {len(spike_issues)} 处）", expanded=True):
+            st.caption("红点 = 该期数值相比前后跳变明显，请对照原始数据核实。")
+            # 每行最多 2 个图
+            cols_per_row = 2
+            for row_start in range(0, len(spike_issues), cols_per_row):
+                row_items = spike_issues[row_start: row_start + cols_per_row]
+                cols = st.columns(len(row_items))
+                for ci, (sn, col, s, idxs) in enumerate(row_items):
+                    with cols[ci]:
+                        # 文字说明：每个红点的日期和数值
+                        details = []
+                        for i in idxs[:3]:
+                            dt  = s.index[i].strftime("%Y-%m-%d") if hasattr(s.index[i], "strftime") else str(s.index[i])
+                            val = round(float(s.iloc[i]), 4)
+                            prev_val = round(float(s.iloc[i-1]), 4) if i > 0 else None
+                            if prev_val is not None:
+                                details.append(f"{dt}：{prev_val} → **{val}**")
+                            else:
+                                details.append(f"{dt}：{val}")
+                        fig = _spike_chart(s, idxs, f"{sn} · {col}")
+                        st.pyplot(fig, use_container_width=True)
+                        plt.close(fig)
+                        st.markdown("  \n".join(details))
 
-    # ── 跨表对比标签页 ───────────────────────────────────────────────
-    if shared_cols:
-        with tabs[-1]:
-            st.markdown(
-                "以下列名在多个子表中均有出现，已将其并排显示。"
-                "**若同一日期的数值不同，请核查数据来源是否一致。**"
-            )
-            st.markdown("---")
+    # ── 展示跨表不一致 ────────────────────────────────────────────────
+    if cross_issues:
+        with st.expander(f"🔀 跨表数据不一致（共 {len(cross_issues)} 列）", expanded=True):
+            st.caption("同一日期、同名列在不同子表中数值不同，红色背景行请重点核查。")
+            for col, merged, diff_dates in cross_issues:
+                st.markdown(f"**列：{col}**")
+                display = merged.copy()
+                display.index = display.index.strftime("%Y-%m-%d")
+                display.index.name = "日期"
+                display = display.round(4)
 
-            for col, sns in shared_cols.items():
-                st.markdown(f"#### 列：{col}　（出现在 {len(sns)} 个子表）")
-
-                # 合并：以日期为索引，各子表作为独立列
-                merged = None
-                for sn in sns:
-                    df = sheets[sn]
-                    dc, vc = sheet_parsed[sn]
-                    if not dc or col not in vc:
-                        continue
-                    sub = df[[dc, col]].copy()
-                    sub[dc] = pd.to_datetime(sub[dc], errors="coerce")
-                    sub = (
-                        sub.dropna(subset=[dc])
-                        .set_index(dc)[[col]]
-                        .rename(columns={col: sn})
-                    )
-                    sub = sub[~sub.index.duplicated(keep="first")]
-                    merged = sub if merged is None else merged.join(sub, how="outer")
-
-                if merged is None or merged.empty:
-                    st.info("无法构建对比表")
-                    continue
-
-                merged = merged.sort_index()
-                merged.index = merged.index.strftime("%Y-%m-%d")
-                merged.index.name = "日期"
-
-                # 若两列均有值，高亮数值不同的行（差异 > 0.01%）
-                def highlight_diff(row):
-                    vals = row.dropna().values
-                    if len(vals) < 2:
+                def _hl(row):
+                    v = row.dropna()
+                    if len(v) < 2:
                         return [""] * len(row)
-                    ref = max(abs(vals).max(), 1e-10)
-                    diff = (max(vals) - min(vals)) / ref
-                    color = "background-color: #ffe0e0" if diff > 0.001 else ""
-                    return [color] * len(row)
+                    ref = max(abs(v).max(), 1e-10)
+                    diff = (v.max() - v.min()) / ref
+                    bg = "background-color:#ffe0e0" if diff > 0.01 else ""
+                    return [bg] * len(row)
 
-                styled = merged.round(4).style.apply(highlight_diff, axis=1)
                 st.dataframe(
-                    styled,
+                    display.style.apply(_hl, axis=1),
                     use_container_width=True,
-                    height=min(520, (len(merged) + 1) * 35 + 50),
+                    height=min(400, (len(display) + 1) * 35 + 50),
                 )
-                st.caption("🔴 标红行表示同一日期各子表数值存在差异")
                 st.markdown("---")
 
 
