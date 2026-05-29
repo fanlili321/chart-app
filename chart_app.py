@@ -106,24 +106,78 @@ div[data-testid="stAlert"] { border-radius: 10px !important; }
 
 # ── 数据复核 ────────────────────────────────────────────────────────
 
-def _detect_spikes(s: pd.Series) -> list[int]:
+def _detect_financial_anomalies(s: pd.Series) -> list[dict]:
     """
-    MAD 检测突变点：计算每期变化量，只有变化量偏离中位水平超过 5 倍 MAD
-    且绝对变化超过数值量级 5% 时才标记，对趋势型数据不敏感。
+    金融数据异常检测，返回 [{"idx": int, "reason": str}, ...]
+
+    金融数据中涨跌 10%+ 都是正常市场行为（A股涨跌停、2015年牛市等），
+    因此不用简单的"变化幅度"判断。只检测以下真正的数据质量问题：
+
+    1. 量级错误（小数点打错）：某期数值与前后两期中位数相差 ≥10 倍
+    2. 孤立尖峰后立刻回落：本期涨幅 ≥ 典型波动的8倍，下期立即反向回落同等幅度
+       —— 真正的牛市/熊市不会立刻反向，这类"一上一下"几乎只有录入错误才会出现
+    3. 零值：金融序列中 0 通常是缺失值被错误填充
     """
-    if len(s) < 6:
+    if len(s) < 4:
         return []
-    changes = s.diff().dropna()
-    med_chg = changes.median()
-    mad     = (changes - med_chg).abs().median()
-    if mad < 1e-10:
-        return []
-    scale = s.abs().median()
-    spikes = []
-    for i, (_, chg) in enumerate(changes.items()):
-        if abs(chg - med_chg) > 5 * mad and abs(chg) > scale * 0.05:
-            spikes.append(i + 1)   # i+1：diff 从第1期开始
-    return spikes
+
+    vals   = s.values.astype(float)
+    result = []
+
+    # 计算典型波动幅度（用百分比收益率的 MAD，适应不同量级的序列）
+    pct = pd.Series(vals).pct_change().dropna()
+    typical_pct = pct.abs().median()   # 该序列正常每期波动的中位数
+    if typical_pct < 1e-6:
+        typical_pct = 0.01  # 兜底：至少 1% 作为基准
+
+    for i in range(len(vals)):
+        v = vals[i]
+
+        # ── 检查 1：零值 ──────────────────────────────────────────────
+        if abs(v) < 1e-9:
+            result.append({"idx": i, "reason": "数值为 0，疑似缺失值被错误填充为 0"})
+            continue
+
+        # ── 检查 2：量级错误（前后 ≥10 倍差距）────────────────────────
+        neighbors = []
+        if i > 0 and abs(vals[i - 1]) > 1e-9:
+            neighbors.append(vals[i - 1])
+        if i < len(vals) - 1 and abs(vals[i + 1]) > 1e-9:
+            neighbors.append(vals[i + 1])
+        if neighbors:
+            ref = float(np.median(neighbors))
+            if ref != 0:
+                ratio = v / ref
+                if ratio > 10 or ratio < 0.1:
+                    fold = max(ratio, 1.0 / ratio)
+                    result.append({
+                        "idx": i,
+                        "reason": f"数值量级异常：与前后期相差约 {fold:.0f} 倍，"
+                                  f"疑似小数点位置错误（前后值约 {ref:.4g}，本期 {v:.4g}）",
+                    })
+                    continue
+
+        # ── 检查 3：孤立尖峰后立刻回落 ──────────────────────────────
+        if i > 0 and i < len(vals) - 1:
+            prev_v = vals[i - 1]
+            next_v = vals[i + 1]
+            if abs(prev_v) > 1e-9 and abs(v) > 1e-9:
+                pct_in  = (v - prev_v) / abs(prev_v)   # 本期相对前期的变化率
+                pct_out = (next_v - v) / abs(v)         # 下期相对本期的变化率
+                # 两端都是大幅变化（≥典型波动8倍），且方向相反
+                threshold = typical_pct * 8
+                if (abs(pct_in) >= threshold and abs(pct_out) >= threshold
+                        and pct_in * pct_out < 0):
+                    result.append({
+                        "idx": i,
+                        "reason": (
+                            f"孤立尖峰：本期相对前期变化 {pct_in*100:+.1f}%，"
+                            f"下期立刻反向变化 {pct_out*100:+.1f}%。"
+                            f"真实行情通常不会立刻完全反向，疑似录入错误"
+                        ),
+                    })
+
+    return result
 
 
 def _context_table(s: pd.Series, spike_idx: int, window: int = 3):
@@ -211,24 +265,20 @@ def _annotate_excel(uploaded_file, sheet_parsed: dict,
         cell.comment = c
 
     # ── 标注突变 ──────────────────────────────────────────────────────
-    for sn, col, s, idxs in spike_issues:
+    for sn, col, s, anomalies in spike_issues:
         if sn not in wb.sheetnames:
             continue
         ws = wb[sn]
-        for idx in idxs:
+        for item in anomalies:
+            idx      = item["idx"]
+            reason   = item["reason"]
             date_val = s.index[idx]
-            curr = round(float(s.iloc[idx]), 4)
-            prev = round(float(s.iloc[idx - 1]), 4) if idx > 0 else None
             r, c = locate_cell(ws, sn, col, date_val)
             if r is None:
                 continue
             cell = ws.cell(row=r, column=c)
             cell.fill = red_fill
-            pct = f"{(curr - prev) / abs(prev) * 100:+.1f}%" if prev else ""
-            note = f"⚠️ 数值突变\n前一期：{prev}\n本期：{curr}"
-            if pct:
-                note += f"\n变化：{pct}"
-            add_comment(cell, note)
+            add_comment(cell, f"⚠️ 数据复核\n{reason}")
 
     # ── 标注跨表不一致 ────────────────────────────────────────────────
     for col_name, merged, diff_mask in cross_issues:
@@ -273,8 +323,8 @@ def _render_data_check_inner(sheets: dict, uploaded_file=None):
             col_to_sheets.setdefault(col, []).append(sn)
     shared_cols = {col: sns for col, sns in col_to_sheets.items() if len(sns) > 1}
 
-    # ── 检测突变 ──────────────────────────────────────────────────────
-    # spike_issues: (sheet名, 列名, 数值Series, [异常行索引列表])
+    # ── 检测异常（金融数据专用逻辑）────────────────────────────────────
+    # spike_issues: (sheet名, 列名, 数值Series, [{"idx":int,"reason":str}])
     spike_issues = []
     for sn, df in sheets.items():
         dc, vc = sheet_parsed[sn]
@@ -286,9 +336,9 @@ def _render_data_check_inner(sheets: dict, uploaded_file=None):
         for col in vc:
             try:
                 s = pd.to_numeric(df_w[col], errors="coerce").dropna()
-                idxs = _detect_spikes(s)
-                if idxs:
-                    spike_issues.append((sn, col, s, idxs))
+                anomalies = _detect_financial_anomalies(s)
+                if anomalies:
+                    spike_issues.append((sn, col, s, anomalies))
             except Exception:
                 continue
 
@@ -325,8 +375,9 @@ def _render_data_check_inner(sheets: dict, uploaded_file=None):
             cross_issues.append((col, merged, diff_mask))
 
     # ── 汇总 ──────────────────────────────────────────────────────────
+    total_anomalies = sum(len(a) for _, _, _, a in spike_issues)
     c1, c2, c3 = st.columns(3)
-    c1.metric("⚠️ 数值突变", len(spike_issues))
+    c1.metric("⚠️ 疑似数据问题", total_anomalies)
     c2.metric("🔀 跨表不一致", len(cross_issues))
     c3.metric("已检查子表数", len(sheets))
 
@@ -334,22 +385,18 @@ def _render_data_check_inner(sheets: dict, uploaded_file=None):
         st.success("✅ 未发现明显数据异常。")
         return
 
-    # ── 展示突变：每处显示前后几行原始数据，异常行标红 ───────────────
+    # ── 展示异常：每处显示前后几行原始数据，异常行标红 ─────────────────
     if spike_issues:
-        with st.expander(f"⚠️ 数值突变（{len(spike_issues)} 处）", expanded=True):
-            st.caption("下表显示异常点前后各3行的原始数据，🔴标红行即为疑似异常，请对照原始Excel核查。")
-            for sn, col, s, idxs in spike_issues:
+        with st.expander(f"⚠️ 疑似数据问题（共 {total_anomalies} 处）", expanded=True):
+            st.caption("🔴 标红行为疑似问题，表格显示该行前后各3期数据，对照原始Excel核查。")
+            for sn, col, s, anomalies in spike_issues:
                 st.markdown(f"**子表：{sn}　｜　列：{col}**")
-                for spike_idx in idxs[:3]:   # 每列最多展示3处
+                for item in anomalies[:3]:   # 每列最多展示3处
+                    spike_idx = item["idx"]
+                    reason    = item["reason"]
                     ctx_df, hl_row = _context_table(s, spike_idx, window=3)
-                    prev = round(float(s.iloc[spike_idx - 1]), 4) if spike_idx > 0 else None
-                    curr = round(float(s.iloc[spike_idx]), 4)
-                    dt   = ctx_df.iloc[hl_row]["日期"]
-                    if prev is not None:
-                        change_pct = (curr - prev) / abs(prev) * 100 if prev != 0 else 0
-                        st.markdown(f"📍 **{dt}**：`{prev}` → `{curr}`（变化 {change_pct:+.1f}%）")
-                    else:
-                        st.markdown(f"📍 **{dt}**：`{curr}`")
+                    dt = ctx_df.iloc[hl_row]["日期"]
+                    st.markdown(f"📍 **{dt}**　— {reason}")
 
                     def _hl_spike(row):
                         return ["background-color:#ffe0e0; font-weight:bold"
