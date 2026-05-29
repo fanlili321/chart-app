@@ -145,15 +145,124 @@ def _context_table(s: pd.Series, spike_idx: int, window: int = 3):
     return df, highlight_row
 
 
-def render_data_check(sheets: dict):
+def _annotate_excel(uploaded_file, sheet_parsed: dict,
+                    spike_issues: list, cross_issues: list):
+    """
+    在原始 Excel 文件中标注异常单元格：
+      - 数值突变 → 红色背景 + 批注说明前值/当前值/变化幅度
+      - 跨表不一致 → 橙色背景 + 批注说明各表数值
+    返回标注后的 xlsx bytes，失败返回 None。
+    """
+    import io
+    import openpyxl
+    from openpyxl.styles import PatternFill
+    from openpyxl.comments import Comment as WsComment
+
+    try:
+        uploaded_file.seek(0)
+        wb = openpyxl.load_workbook(uploaded_file)
+    except Exception:
+        return None   # xls 等不支持的格式直接跳过
+
+    red_fill    = PatternFill(start_color="FFD0D0", end_color="FFD0D0", fill_type="solid")
+    orange_fill = PatternFill(start_color="FFE8B0", end_color="FFE8B0", fill_type="solid")
+
+    def locate_cell(ws, sheet_name, col_name, date_val):
+        """在工作表中找到「列名 + 日期」对应的单元格 (row, col)，找不到返回 (None, None)。"""
+        dc_name = sheet_parsed.get(sheet_name, (None, []))[0]
+        header_row = col_idx = date_col_idx = None
+
+        # 扫描找表头行（含列名的行）
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.value == col_name:
+                    header_row = cell.row
+                    col_idx    = cell.column
+                    break
+            if header_row:
+                break
+        if not header_row:
+            return None, None
+
+        # 找日期列
+        for cell in ws[header_row]:
+            if cell.value == dc_name:
+                date_col_idx = cell.column
+                break
+        if not date_col_idx:
+            return None, None
+
+        # 匹配日期行
+        target = date_val.strftime("%Y-%m-%d") if hasattr(date_val, "strftime") else str(date_val)
+        for r in range(header_row + 1, ws.max_row + 1):
+            raw = ws.cell(row=r, column=date_col_idx).value
+            if raw is None:
+                continue
+            try:
+                if pd.to_datetime(raw).strftime("%Y-%m-%d") == target:
+                    return r, col_idx
+            except Exception:
+                pass
+        return None, None
+
+    def add_comment(cell, text):
+        c = WsComment(text, "数据复核")
+        c.width, c.height = 240, 80
+        cell.comment = c
+
+    # ── 标注突变 ──────────────────────────────────────────────────────
+    for sn, col, s, idxs in spike_issues:
+        if sn not in wb.sheetnames:
+            continue
+        ws = wb[sn]
+        for idx in idxs:
+            date_val = s.index[idx]
+            curr = round(float(s.iloc[idx]), 4)
+            prev = round(float(s.iloc[idx - 1]), 4) if idx > 0 else None
+            r, c = locate_cell(ws, sn, col, date_val)
+            if r is None:
+                continue
+            cell = ws.cell(row=r, column=c)
+            cell.fill = red_fill
+            pct = f"{(curr - prev) / abs(prev) * 100:+.1f}%" if prev else ""
+            note = f"⚠️ 数值突变\n前一期：{prev}\n本期：{curr}"
+            if pct:
+                note += f"\n变化：{pct}"
+            add_comment(cell, note)
+
+    # ── 标注跨表不一致 ────────────────────────────────────────────────
+    for col_name, merged, diff_mask in cross_issues:
+        diff_dates = merged.index[diff_mask.values if hasattr(diff_mask, "values") else diff_mask]
+        for sn in merged.columns:
+            if sn not in wb.sheetnames:
+                continue
+            ws = wb[sn]
+            for date_val in diff_dates:
+                r, c = locate_cell(ws, sn, col_name, date_val)
+                if r is None:
+                    continue
+                cell = ws.cell(row=r, column=c)
+                cell.fill = orange_fill
+                others = [f"{c2}={round(float(merged.loc[date_val, c2]), 4)}"
+                          for c2 in merged.columns if c2 != sn and date_val in merged.index]
+                note = f"🔀 跨表不一致\n本表：{round(float(merged.loc[date_val, sn]), 4)}\n其他：{', '.join(others)}"
+                add_comment(cell, note)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def render_data_check(sheets: dict, uploaded_file=None):
     """数据复核：自动检测突变 + 跨表不一致，展示原始数据定位。"""
     try:
-        _render_data_check_inner(sheets)
+        _render_data_check_inner(sheets, uploaded_file)
     except Exception as e:
         st.warning(f"数据复核出现错误（{e}），已跳过。")
 
 
-def _render_data_check_inner(sheets: dict):
+def _render_data_check_inner(sheets: dict, uploaded_file=None):
     # ── 准备 ──────────────────────────────────────────────────────────
     sheet_parsed = {}
     col_to_sheets = {}
@@ -276,7 +385,25 @@ def _render_data_check_inner(sheets: dict):
                     height=min(420, (len(display) + 1) * 35 + 10),
                 )
                 st.markdown("---")
-                st.markdown("---")
+
+    # ── 下载标注版 Excel ──────────────────────────────────────────────
+    if uploaded_file is not None and uploaded_file.name.lower().endswith(".xlsx"):
+        st.markdown("#### 📥 下载标注版文件")
+        st.caption("异常单元格已在原文件中标红/标橙，并附批注说明问题，打开后即可对照核查。")
+        annotated = _annotate_excel(uploaded_file, sheet_parsed, spike_issues, cross_issues)
+        if annotated:
+            base_name = uploaded_file.name.rsplit(".", 1)[0]
+            st.download_button(
+                label="下载标注版 Excel",
+                data=annotated,
+                file_name=f"{base_name}_数据复核标注.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+            )
+        else:
+            st.info("无法生成标注文件，请手动对照上方表格核查。")
+    elif uploaded_file is not None and not uploaded_file.name.lower().endswith(".xlsx"):
+        st.info("当前文件为 .xls/.csv 格式，暂不支持标注导出；建议另存为 .xlsx 后重新上传。")
 
 
 # ── 工具函数 ────────────────────────────────────────────────────────
@@ -875,7 +1002,7 @@ with st.expander("🔍 数据预览（确认列名是否正确识别）", expand
 st.markdown("---")
 section_title("1", "数据复核")
 st.caption("自动检测：数值突增突降 · 跨表同列数据不一致")
-render_data_check(sheets)
+render_data_check(sheets, uploaded_file=uploaded)
 
 # ── 第二步：作图 ─────────────────────────────────────────────────────
 st.markdown("---")
