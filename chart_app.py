@@ -177,10 +177,13 @@ def _render_data_check_inner(sheets: dict):
         df_w["__d__"] = pd.to_datetime(df_w[dc], errors="coerce")
         df_w = df_w.dropna(subset=["__d__"]).set_index("__d__").sort_index()
         for col in vc:
-            s = pd.to_numeric(df_w[col], errors="coerce").dropna()
-            idxs = _detect_spikes(s)
-            if idxs:
-                spike_issues.append((sn, col, s, idxs))
+            try:
+                s = pd.to_numeric(df_w[col], errors="coerce").dropna()
+                idxs = _detect_spikes(s)
+                if idxs:
+                    spike_issues.append((sn, col, s, idxs))
+            except Exception:
+                continue
 
     # ── 收集跨表不一致 ────────────────────────────────────────────────
     cross_issues = []   # (col, merged_df, diff_dates)
@@ -193,7 +196,9 @@ def _render_data_check_inner(sheets: dict):
                 continue
             sub = df[[dc, col]].copy()
             sub[dc] = pd.to_datetime(sub[dc], errors="coerce")
-            sub = (sub.dropna(subset=[dc])
+            # 强制转换为数值，避免 datetime64 进入 abs()
+            sub[col] = pd.to_numeric(sub[col], errors="coerce")
+            sub = (sub.dropna(subset=[dc, col])
                    .set_index(dc)[[col]]
                    .rename(columns={col: sn}))
             sub = sub[~sub.index.duplicated(keep="first")]
@@ -203,11 +208,11 @@ def _render_data_check_inner(sheets: dict):
         merged = merged.sort_index()
         # 找出同日期数值差异 > 1% 的行
         def row_diff(row):
-            v = row.dropna()
+            v = pd.to_numeric(row, errors="coerce").dropna()
             if len(v) < 2:
                 return 0.0
-            ref = max(abs(v).max(), 1e-10)
-            return (v.max() - v.min()) / ref
+            ref = max(float(v.abs().max()), 1e-10)
+            return float((v.max() - v.min()) / ref)
         diff_mask = merged.apply(row_diff, axis=1) > 0.01
         diff_dates = merged.index[diff_mask]
         if len(diff_dates) > 0:
@@ -261,11 +266,11 @@ def _render_data_check_inner(sheets: dict):
                 display = display.round(4)
 
                 def _hl(row):
-                    v = row.dropna()
+                    v = pd.to_numeric(row, errors="coerce").dropna()
                     if len(v) < 2:
                         return [""] * len(row)
-                    ref = max(abs(v).max(), 1e-10)
-                    diff = (v.max() - v.min()) / ref
+                    ref = max(float(v.abs().max()), 1e-10)
+                    diff = float((v.max() - v.min()) / ref)
                     bg = "background-color:#ffe0e0" if diff > 0.01 else ""
                     return [bg] * len(row)
 
