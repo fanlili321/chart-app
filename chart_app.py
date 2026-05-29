@@ -108,11 +108,13 @@ div[data-testid="stAlert"] { border-radius: 10px !important; }
 
 def run_data_checks(sheets: dict) -> list:
     """
-    对所有子表执行三类数据质量检查，返回问题列表。
-    每个问题字段：level / sheet / col / date / value / type / detail
+    数据复核：只报告真正明显的异常，避免误报。
+    检查两类问题：
+      1. 数据突变：某期数值相比前一期跳变幅度远超该列历史正常水平
+      2. 跨表不一致：同一列名、同一日期在不同子表里数值差异超过 30%
     """
     issues = []
-    all_col_data = {}   # {col_name: {date_str: {sheet_name: value}}}，用于跨表比对
+    all_col_data = {}   # {col: {date_str: {sheet: value}}}
 
     for sheet_name, df in sheets.items():
         date_col, value_cols = detect_date_and_value_cols(df)
@@ -125,159 +127,149 @@ def run_data_checks(sheets: dict) -> list:
 
         for col in value_cols:
             s = pd.to_numeric(df_w[col], errors="coerce").dropna()
-            if len(s) < 4:
+            if len(s) < 5:
                 continue
 
-            # ── 跨表数据收集 ────────────────────────────────────────
+            # 跨表数据收集
             if col not in all_col_data:
                 all_col_data[col] = {}
             for dt, val in s.items():
-                ds = dt.strftime("%Y-%m-%d")
-                all_col_data[col].setdefault(ds, {})[sheet_name] = float(val)
+                all_col_data[col].setdefault(
+                    dt.strftime("%Y-%m-%d"), {}
+                )[sheet_name] = float(val)
 
-            # ── 检查1：突增突降（5σ） ─────────────────────────────
-            diffs = s.diff().dropna()
-            d_std = diffs.std()
-            d_mean = diffs.mean()
-            if d_std < 1e-10:
+            # ── 检查：数据突变 ────────────────────────────────────
+            # 用每期变化量的中位数作为"正常波动基准"
+            # 只有当某期变化量超过基准的 10 倍，且绝对变化超过数值中位数的 15%，才报警
+            # 这样能过滤掉：趋势型涨跌、波动本来就大的序列
+            changes     = s.diff().dropna()
+            typical_chg = changes.abs().median()   # 正常每期波动幅度
+            ref_scale   = s.abs().median()         # 数值量级参考
+            if typical_chg < 1e-10 or ref_scale < 1e-10:
                 continue
 
-            already_flagged = set()
             for i in range(1, len(s)):
-                chg = s.iloc[i] - s.iloc[i - 1]
-                z = abs(chg - d_mean) / d_std
-                if z >= 5:
-                    dt_str = s.index[i].strftime("%Y-%m-%d")
-                    # 判断下一期是否"回归正常"（疑似录入错误）
-                    revert = ""
-                    if i + 1 < len(s):
-                        chg2 = s.iloc[i + 1] - s.iloc[i]
-                        z2 = abs(chg2 - d_mean) / d_std
-                        if z2 >= 4:
-                            revert = "，下期回落，疑似录入错误"
-                    issues.append({
-                        "level":    "high" if z >= 7 or revert else "medium",
-                        "sheet":    sheet_name,
-                        "col":      col,
-                        "date":     dt_str,
-                        "value":    round(float(s.iloc[i]), 6),
-                        "prev":     round(float(s.iloc[i - 1]), 6),
-                        "type":     "突增突降",
-                        "detail":   f"较前期变化 {chg:+.4g}（{z:.1f}σ）{revert}",
-                    })
-                    already_flagged.add(i)
+                chg     = s.iloc[i] - s.iloc[i - 1]
+                abs_chg = abs(chg)
 
-            # ── 检查2：统计离群值（3×IQR，极端值） ─────────────────
-            q1, q3 = s.quantile(0.25), s.quantile(0.75)
-            iqr = q3 - q1
-            if iqr < 1e-10:
-                continue
-            lo, hi = q1 - 3.0 * iqr, q3 + 3.0 * iqr
-            for i, (dt, val) in enumerate(s.items()):
-                if i in already_flagged:
+                # 双重门槛：变化幅度超过典型波动10倍，且超过数值量级15%
+                if abs_chg < typical_chg * 10:
                     continue
-                if val < lo or val > hi:
-                    issues.append({
-                        "level":  "medium",
-                        "sheet":  sheet_name,
-                        "col":    col,
-                        "date":   dt.strftime("%Y-%m-%d"),
-                        "value":  round(float(val), 6),
-                        "prev":   None,
-                        "type":   "统计离群值",
-                        "detail": f"正常区间 [{lo:.4g}, {hi:.4g}]，实际值 {val:.4g}",
-                    })
+                if abs_chg < ref_scale * 0.15:
+                    continue
 
-    # ── 检查3：跨表数据不一致（同列名、同日期、差异>2%） ──────────
+                prev_v = round(float(s.iloc[i - 1]), 4)
+                curr_v = round(float(s.iloc[i]),     4)
+                pct    = chg / abs(s.iloc[i - 1]) * 100 if s.iloc[i - 1] != 0 else 0
+                dt_str = s.index[i].strftime("%Y-%m-%d")
+
+                # 判断是否"一次性异常"：下一期也发生了大幅反向变化
+                one_off = False
+                if i + 1 < len(s):
+                    chg2 = abs(s.iloc[i + 1] - s.iloc[i])
+                    if chg2 >= typical_chg * 8:
+                        one_off = True
+
+                if one_off:
+                    desc  = (f"数值从 {prev_v} 突然变为 {curr_v}（变动幅度 {pct:+.1f}%），"
+                             f"下一期随即大幅回落，很可能是录入错误，请核查原始数据")
+                    level = "high"
+                else:
+                    desc  = (f"数值从 {prev_v} 变为 {curr_v}（变动幅度 {pct:+.1f}%），"
+                             f"这一期的变动远超该列平时的正常波动，请确认数据是否正确")
+                    level = "medium"
+
+                issues.append({
+                    "level": level,
+                    "sheet": sheet_name,
+                    "col":   col,
+                    "date":  dt_str,
+                    "prev":  prev_v,
+                    "value": curr_v,
+                    "type":  "数据突变",
+                    "detail": desc,
+                })
+
+    # ── 检查：跨表数据不一致 ──────────────────────────────────────
+    # 门槛较高（差异 ≥ 30%），且每列只报差异最大的前 3 处，避免刷屏
     for col, date_map in all_col_data.items():
+        candidates = []
         for ds, sv in date_map.items():
             if len(sv) < 2:
                 continue
             vals = list(sv.values())
             mx, mn = max(vals), min(vals)
-            base = max(abs(mx), abs(mn), 1e-10)
-            ratio = abs(mx - mn) / base
-            if ratio >= 0.02:
-                sheets_str = "  vs  ".join(
-                    f"[{sn}] {v:.4g}" for sn, v in sv.items()
-                )
-                issues.append({
-                    "level":  "high" if ratio >= 0.10 else "medium",
-                    "sheet":  "跨表",
-                    "col":    col,
-                    "date":   ds,
-                    "value":  None,
-                    "prev":   None,
-                    "type":   "跨表数据不一致",
-                    "detail": f"{sheets_str}（差异 {ratio*100:.1f}%）",
-                })
+            ref = max(abs(mx), abs(mn), 1e-10)
+            ratio = abs(mx - mn) / ref
+            if ratio >= 0.30:
+                candidates.append((ratio, ds, sv))
 
-    # 按严重程度排序（high 在前）
+        if not candidates:
+            continue
+
+        candidates.sort(reverse=True)
+        for ratio, ds, sv in candidates[:3]:
+            parts = "、".join(f"「{sn}」中是 {v:.4g}" for sn, v in sv.items())
+            issues.append({
+                "level":  "high" if ratio >= 0.50 else "medium",
+                "sheet":  "跨表对比",
+                "col":    col,
+                "date":   ds,
+                "prev":   None,
+                "value":  None,
+                "type":   "跨表数据不一致",
+                "detail": (f"「{col}」列在 {ds} 这天：{parts}，"
+                           f"两个表的数值相差 {ratio*100:.0f}%，"
+                           f"请确认是否用了不同版本或不同口径的数据"),
+            })
+
     issues.sort(key=lambda x: 0 if x["level"] == "high" else 1)
     return issues
 
 
 def render_data_check(sheets: dict):
-    """在 Streamlit 页面渲染数据复核结果。"""
-    with st.spinner("正在对所有子表进行数据复核…"):
+    """渲染数据复核结果。"""
+    from collections import defaultdict
+
+    with st.spinner("正在检查数据，请稍候…"):
         issues = run_data_checks(sheets)
 
     high   = [i for i in issues if i["level"] == "high"]
     medium = [i for i in issues if i["level"] == "medium"]
 
-    # ── 汇总指标 ──────────────────────────────────────────────────
-    m1, m2, m3 = st.columns(3)
-    m1.metric("🔴 高风险问题", len(high),   help="突变幅度极大 / 疑似录入错误 / 跨表差异≥10%")
-    m2.metric("🟡 需关注",     len(medium), help="统计离群值 / 跨表差异2%~10%")
-    m3.metric("📋 检查子表数", len(sheets))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("🔴 需立即核查", len(high))
+    c2.metric("🟡 建议确认",   len(medium))
+    c3.metric("共检查子表数",  len(sheets))
 
     if not issues:
-        st.success("✅ 未发现异常数据，数据质量良好，可直接生成图表。")
+        st.success("✅ 数据看起来正常，未发现明显异常，可以直接出图。")
         return
 
-    # ── 分类展示 ──────────────────────────────────────────────────
-    ICON = {"high": "🔴", "medium": "🟡"}
-    TYPE_COLOR = {
-        "突增突降":     "#FF4B4B",
-        "统计离群值":   "#FFA500",
-        "跨表数据不一致": "#CC4400",
-    }
-
-    # 按问题类型分组
-    from collections import defaultdict
     grouped = defaultdict(list)
     for iss in issues:
         grouped[iss["type"]].append(iss)
 
     for ptype, plist in grouped.items():
-        color = TYPE_COLOR.get(ptype, "#888")
+        n_high = sum(1 for i in plist if i["level"] == "high")
+        icon   = "🔴" if n_high else "🟡"
         with st.expander(
-            f"{ICON[plist[0]['level']]} **{ptype}**　共 {len(plist)} 处",
-            expanded=(ptype == "突增突降" or ptype == "跨表数据不一致"),
+            f"{icon} **{ptype}**　发现 {len(plist)} 处",
+            expanded=True,
         ):
-            rows = []
             for iss in plist:
-                row = {
-                    "严重程度": "🔴 高风险" if iss["level"] == "high" else "🟡 需关注",
-                    "子表":     iss["sheet"],
-                    "列名":     iss["col"],
-                    "日期":     iss["date"],
-                    "问题描述": iss["detail"],
-                }
-                if iss["value"] is not None:
-                    row["当前值"] = iss["value"]
-                if iss.get("prev") is not None:
-                    row["前期值"] = iss["prev"]
-                rows.append(row)
-            st.dataframe(
-                pd.DataFrame(rows),
-                use_container_width=True,
-                hide_index=True,
-            )
+                badge = "🔴 需立即核查" if iss["level"] == "high" else "🟡 建议确认"
+                loc   = f"子表「{iss['sheet']}」· 列「{iss['col']}」· {iss['date']}"
+                st.markdown(
+                    f"**{badge}**　{loc}\n\n"
+                    f"&nbsp;&nbsp;&nbsp;&nbsp;{iss['detail']}"
+                )
+                st.divider()
 
     st.warning(
-        f"⚠️ 共发现 **{len(issues)}** 处潜在问题（{len(high)} 高风险 / {len(medium)} 需关注）。"
-        "建议核查原始数据后再生成图表，或忽略继续生成。"
+        f"⚠️ 共发现 {len(issues)} 处可能的数据问题"
+        f"（{len(high)} 处需立即核查 / {len(medium)} 处建议确认）。"
+        "建议先对照原始数据确认后再出图，也可以忽略直接继续。"
     )
 
 
