@@ -104,6 +104,183 @@ div[data-testid="stAlert"] { border-radius: 10px !important; }
 </style>
 """, unsafe_allow_html=True)
 
+# ── 数据复核 ────────────────────────────────────────────────────────
+
+def run_data_checks(sheets: dict) -> list:
+    """
+    对所有子表执行三类数据质量检查，返回问题列表。
+    每个问题字段：level / sheet / col / date / value / type / detail
+    """
+    issues = []
+    all_col_data = {}   # {col_name: {date_str: {sheet_name: value}}}，用于跨表比对
+
+    for sheet_name, df in sheets.items():
+        date_col, value_cols = detect_date_and_value_cols(df)
+        if not date_col or not value_cols:
+            continue
+
+        df_w = df.copy()
+        df_w["__date__"] = pd.to_datetime(df_w[date_col], errors="coerce")
+        df_w = df_w.dropna(subset=["__date__"]).set_index("__date__").sort_index()
+
+        for col in value_cols:
+            s = pd.to_numeric(df_w[col], errors="coerce").dropna()
+            if len(s) < 4:
+                continue
+
+            # ── 跨表数据收集 ────────────────────────────────────────
+            if col not in all_col_data:
+                all_col_data[col] = {}
+            for dt, val in s.items():
+                ds = dt.strftime("%Y-%m-%d")
+                all_col_data[col].setdefault(ds, {})[sheet_name] = float(val)
+
+            # ── 检查1：突增突降（5σ） ─────────────────────────────
+            diffs = s.diff().dropna()
+            d_std = diffs.std()
+            d_mean = diffs.mean()
+            if d_std < 1e-10:
+                continue
+
+            already_flagged = set()
+            for i in range(1, len(s)):
+                chg = s.iloc[i] - s.iloc[i - 1]
+                z = abs(chg - d_mean) / d_std
+                if z >= 5:
+                    dt_str = s.index[i].strftime("%Y-%m-%d")
+                    # 判断下一期是否"回归正常"（疑似录入错误）
+                    revert = ""
+                    if i + 1 < len(s):
+                        chg2 = s.iloc[i + 1] - s.iloc[i]
+                        z2 = abs(chg2 - d_mean) / d_std
+                        if z2 >= 4:
+                            revert = "，下期回落，疑似录入错误"
+                    issues.append({
+                        "level":    "high" if z >= 7 or revert else "medium",
+                        "sheet":    sheet_name,
+                        "col":      col,
+                        "date":     dt_str,
+                        "value":    round(float(s.iloc[i]), 6),
+                        "prev":     round(float(s.iloc[i - 1]), 6),
+                        "type":     "突增突降",
+                        "detail":   f"较前期变化 {chg:+.4g}（{z:.1f}σ）{revert}",
+                    })
+                    already_flagged.add(i)
+
+            # ── 检查2：统计离群值（3×IQR，极端值） ─────────────────
+            q1, q3 = s.quantile(0.25), s.quantile(0.75)
+            iqr = q3 - q1
+            if iqr < 1e-10:
+                continue
+            lo, hi = q1 - 3.0 * iqr, q3 + 3.0 * iqr
+            for i, (dt, val) in enumerate(s.items()):
+                if i in already_flagged:
+                    continue
+                if val < lo or val > hi:
+                    issues.append({
+                        "level":  "medium",
+                        "sheet":  sheet_name,
+                        "col":    col,
+                        "date":   dt.strftime("%Y-%m-%d"),
+                        "value":  round(float(val), 6),
+                        "prev":   None,
+                        "type":   "统计离群值",
+                        "detail": f"正常区间 [{lo:.4g}, {hi:.4g}]，实际值 {val:.4g}",
+                    })
+
+    # ── 检查3：跨表数据不一致（同列名、同日期、差异>2%） ──────────
+    for col, date_map in all_col_data.items():
+        for ds, sv in date_map.items():
+            if len(sv) < 2:
+                continue
+            vals = list(sv.values())
+            mx, mn = max(vals), min(vals)
+            base = max(abs(mx), abs(mn), 1e-10)
+            ratio = abs(mx - mn) / base
+            if ratio >= 0.02:
+                sheets_str = "  vs  ".join(
+                    f"[{sn}] {v:.4g}" for sn, v in sv.items()
+                )
+                issues.append({
+                    "level":  "high" if ratio >= 0.10 else "medium",
+                    "sheet":  "跨表",
+                    "col":    col,
+                    "date":   ds,
+                    "value":  None,
+                    "prev":   None,
+                    "type":   "跨表数据不一致",
+                    "detail": f"{sheets_str}（差异 {ratio*100:.1f}%）",
+                })
+
+    # 按严重程度排序（high 在前）
+    issues.sort(key=lambda x: 0 if x["level"] == "high" else 1)
+    return issues
+
+
+def render_data_check(sheets: dict):
+    """在 Streamlit 页面渲染数据复核结果。"""
+    with st.spinner("正在对所有子表进行数据复核…"):
+        issues = run_data_checks(sheets)
+
+    high   = [i for i in issues if i["level"] == "high"]
+    medium = [i for i in issues if i["level"] == "medium"]
+
+    # ── 汇总指标 ──────────────────────────────────────────────────
+    m1, m2, m3 = st.columns(3)
+    m1.metric("🔴 高风险问题", len(high),   help="突变幅度极大 / 疑似录入错误 / 跨表差异≥10%")
+    m2.metric("🟡 需关注",     len(medium), help="统计离群值 / 跨表差异2%~10%")
+    m3.metric("📋 检查子表数", len(sheets))
+
+    if not issues:
+        st.success("✅ 未发现异常数据，数据质量良好，可直接生成图表。")
+        return
+
+    # ── 分类展示 ──────────────────────────────────────────────────
+    ICON = {"high": "🔴", "medium": "🟡"}
+    TYPE_COLOR = {
+        "突增突降":     "#FF4B4B",
+        "统计离群值":   "#FFA500",
+        "跨表数据不一致": "#CC4400",
+    }
+
+    # 按问题类型分组
+    from collections import defaultdict
+    grouped = defaultdict(list)
+    for iss in issues:
+        grouped[iss["type"]].append(iss)
+
+    for ptype, plist in grouped.items():
+        color = TYPE_COLOR.get(ptype, "#888")
+        with st.expander(
+            f"{ICON[plist[0]['level']]} **{ptype}**　共 {len(plist)} 处",
+            expanded=(ptype == "突增突降" or ptype == "跨表数据不一致"),
+        ):
+            rows = []
+            for iss in plist:
+                row = {
+                    "严重程度": "🔴 高风险" if iss["level"] == "high" else "🟡 需关注",
+                    "子表":     iss["sheet"],
+                    "列名":     iss["col"],
+                    "日期":     iss["date"],
+                    "问题描述": iss["detail"],
+                }
+                if iss["value"] is not None:
+                    row["当前值"] = iss["value"]
+                if iss.get("prev") is not None:
+                    row["前期值"] = iss["prev"]
+                rows.append(row)
+            st.dataframe(
+                pd.DataFrame(rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.warning(
+        f"⚠️ 共发现 **{len(issues)}** 处潜在问题（{len(high)} 高风险 / {len(medium)} 需关注）。"
+        "建议核查原始数据后再生成图表，或忽略继续生成。"
+    )
+
+
 # ── 工具函数 ────────────────────────────────────────────────────────
 
 def find_header_row(raw: pd.DataFrame) -> int:
@@ -696,9 +873,15 @@ with st.expander("🔍 数据预览（确认列名是否正确识别）", expand
         st.caption(f"子表：{sn}")
         st.dataframe(sheets[sn].head(), use_container_width=True)
 
-# ── 第一步：选择子表 ─────────────────────────────────────────────────
+# ── 数据复核 ─────────────────────────────────────────────────────────
 st.markdown("---")
-section_title("1", "选择要生成图表的子表")
+section_title("1", "数据复核")
+st.caption("上传后自动检查：突增突降 · 统计离群值 · 跨表数据不一致，发现问题会高亮提示")
+render_data_check(sheets)
+
+# ── 第二步：选择子表 ──────────────────────────────────────────────────
+st.markdown("---")
+section_title("2", "选择要生成图表的子表")
 
 _loaded = st.session_state.get("loaded_cfg", {})
 _loaded_sheets = [s for s in _loaded.get("selected_sheets", sheet_names) if s in sheet_names]
@@ -718,7 +901,7 @@ if not selected_sheets:
 
 # ── 第二步：逐表配置 ─────────────────────────────────────────────────
 st.markdown("---")
-section_title("2", "配置每张图表")
+section_title("3", "配置每张图表")
 
 all_configs = {}
 _loaded_configs = _loaded.get("configs", {})
@@ -937,7 +1120,7 @@ st.session_state["all_configs"] = all_configs
 
 # ── 第三步：批量生成 ──────────────────────────────────────────────────
 st.markdown("---")
-section_title("3", "批量生成全部图表")
+section_title("4", "批量生成全部图表")
 generate_btn = st.button(
     f"🚀 一键生成全部图表（共 {len(selected_sheets)} 张）",
     type="primary",
