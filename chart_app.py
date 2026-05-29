@@ -153,7 +153,7 @@ def render_data_check(sheets: dict):
     try:
         _render_data_check_inner(sheets)
     except Exception as e:
-        st.warning(f"数据复核模块出现错误（{e}），已跳过，可直接出图。")
+        st.warning(f"数据复核出现错误（{e}），已跳过。")
 
 
 def _render_data_check_inner(sheets: dict):
@@ -225,7 +225,7 @@ def _render_data_check_inner(sheets: dict):
     c3.metric("共检查子表", len(sheets))
 
     if not spike_issues and not cross_issues:
-        st.success("✅ 未发现明显数据异常，可以直接出图。")
+        st.success("✅ 未发现明显数据异常。")
         return
 
     # ── 展示突变 ──────────────────────────────────────────────────────
@@ -877,12 +877,13 @@ with st.expander("🔍 数据预览（确认列名是否正确识别）", expand
 # ── 数据复核 ─────────────────────────────────────────────────────────
 st.markdown("---")
 section_title("1", "数据复核")
-st.caption("上传后自动检查：突增突降 · 统计离群值 · 跨表数据不一致，发现问题会高亮提示")
+st.caption("自动检测：数值突增突降 · 跨表同列数据不一致")
 render_data_check(sheets)
 
-# ── 第二步：选择子表 ──────────────────────────────────────────────────
+# ── 第二步：作图 ─────────────────────────────────────────────────────
 st.markdown("---")
-section_title("2", "选择要生成图表的子表")
+section_title("2", "作图")
+st.markdown("**① 选择子表**")
 
 _loaded = st.session_state.get("loaded_cfg", {})
 _loaded_sheets = [s for s in _loaded.get("selected_sheets", sheet_names) if s in sheet_names]
@@ -900,9 +901,8 @@ if not selected_sheets:
     st.warning("请至少选择一个子表。")
     st.stop()
 
-# ── 第二步：逐表配置 ─────────────────────────────────────────────────
-st.markdown("---")
-section_title("3", "配置每张图表")
+# ── 逐表配置 ─────────────────────────────────────────────────────────
+st.markdown("**② 配置每张图表**")
 
 all_configs = {}
 _loaded_configs = _loaded.get("configs", {})
@@ -1119,9 +1119,8 @@ for idx, sheet_name in enumerate(selected_sheets):
 
 st.session_state["all_configs"] = all_configs
 
-# ── 第三步：批量生成 ──────────────────────────────────────────────────
-st.markdown("---")
-section_title("4", "批量生成全部图表")
+# ── 批量生成 ─────────────────────────────────────────────────────────
+st.markdown("**③ 生成图表**")
 generate_btn = st.button(
     f"🚀 一键生成全部图表（共 {len(selected_sheets)} 张）",
     type="primary",
