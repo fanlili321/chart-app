@@ -106,171 +106,125 @@ div[data-testid="stAlert"] { border-radius: 10px !important; }
 
 # ── 数据复核 ────────────────────────────────────────────────────────
 
-def run_data_checks(sheets: dict) -> list:
-    """
-    数据复核：只报告真正明显的异常，避免误报。
-    检查两类问题：
-      1. 数据突变：某期数值相比前一期跳变幅度远超该列历史正常水平
-      2. 跨表不一致：同一列名、同一日期在不同子表里数值差异超过 30%
-    """
-    issues = []
-    all_col_data = {}   # {col: {date_str: {sheet: value}}}
-
-    for sheet_name, df in sheets.items():
-        date_col, value_cols = detect_date_and_value_cols(df)
-        if not date_col or not value_cols:
-            continue
-
-        df_w = df.copy()
-        df_w["__date__"] = pd.to_datetime(df_w[date_col], errors="coerce")
-        df_w = df_w.dropna(subset=["__date__"]).set_index("__date__").sort_index()
-
-        for col in value_cols:
-            s = pd.to_numeric(df_w[col], errors="coerce").dropna()
-            if len(s) < 5:
-                continue
-
-            # 跨表数据收集
-            if col not in all_col_data:
-                all_col_data[col] = {}
-            for dt, val in s.items():
-                all_col_data[col].setdefault(
-                    dt.strftime("%Y-%m-%d"), {}
-                )[sheet_name] = float(val)
-
-            # ── 检查：数据突变 ────────────────────────────────────
-            # 用每期变化量的中位数作为"正常波动基准"
-            # 只有当某期变化量超过基准的 10 倍，且绝对变化超过数值中位数的 15%，才报警
-            # 这样能过滤掉：趋势型涨跌、波动本来就大的序列
-            changes     = s.diff().dropna()
-            typical_chg = changes.abs().median()   # 正常每期波动幅度
-            ref_scale   = s.abs().median()         # 数值量级参考
-            if typical_chg < 1e-10 or ref_scale < 1e-10:
-                continue
-
-            for i in range(1, len(s)):
-                chg     = s.iloc[i] - s.iloc[i - 1]
-                abs_chg = abs(chg)
-
-                # 双重门槛：变化幅度超过典型波动10倍，且超过数值量级15%
-                if abs_chg < typical_chg * 10:
-                    continue
-                if abs_chg < ref_scale * 0.15:
-                    continue
-
-                prev_v = round(float(s.iloc[i - 1]), 4)
-                curr_v = round(float(s.iloc[i]),     4)
-                pct    = chg / abs(s.iloc[i - 1]) * 100 if s.iloc[i - 1] != 0 else 0
-                dt_str = s.index[i].strftime("%Y-%m-%d")
-
-                # 判断是否"一次性异常"：下一期也发生了大幅反向变化
-                one_off = False
-                if i + 1 < len(s):
-                    chg2 = abs(s.iloc[i + 1] - s.iloc[i])
-                    if chg2 >= typical_chg * 8:
-                        one_off = True
-
-                if one_off:
-                    desc  = (f"数值从 {prev_v} 突然变为 {curr_v}（变动幅度 {pct:+.1f}%），"
-                             f"下一期随即大幅回落，很可能是录入错误，请核查原始数据")
-                    level = "high"
-                else:
-                    desc  = (f"数值从 {prev_v} 变为 {curr_v}（变动幅度 {pct:+.1f}%），"
-                             f"这一期的变动远超该列平时的正常波动，请确认数据是否正确")
-                    level = "medium"
-
-                issues.append({
-                    "level": level,
-                    "sheet": sheet_name,
-                    "col":   col,
-                    "date":  dt_str,
-                    "prev":  prev_v,
-                    "value": curr_v,
-                    "type":  "数据突变",
-                    "detail": desc,
-                })
-
-    # ── 检查：跨表数据不一致 ──────────────────────────────────────
-    # 门槛较高（差异 ≥ 30%），且每列只报差异最大的前 3 处，避免刷屏
-    for col, date_map in all_col_data.items():
-        candidates = []
-        for ds, sv in date_map.items():
-            if len(sv) < 2:
-                continue
-            vals = list(sv.values())
-            mx, mn = max(vals), min(vals)
-            ref = max(abs(mx), abs(mn), 1e-10)
-            ratio = abs(mx - mn) / ref
-            if ratio >= 0.30:
-                candidates.append((ratio, ds, sv))
-
-        if not candidates:
-            continue
-
-        candidates.sort(reverse=True)
-        for ratio, ds, sv in candidates[:3]:
-            parts = "、".join(f"「{sn}」中是 {v:.4g}" for sn, v in sv.items())
-            issues.append({
-                "level":  "high" if ratio >= 0.50 else "medium",
-                "sheet":  "跨表对比",
-                "col":    col,
-                "date":   ds,
-                "prev":   None,
-                "value":  None,
-                "type":   "跨表数据不一致",
-                "detail": (f"「{col}」列在 {ds} 这天：{parts}，"
-                           f"两个表的数值相差 {ratio*100:.0f}%，"
-                           f"请确认是否用了不同版本或不同口径的数据"),
-            })
-
-    issues.sort(key=lambda x: 0 if x["level"] == "high" else 1)
-    return issues
-
-
 def render_data_check(sheets: dict):
-    """渲染数据复核结果。"""
-    from collections import defaultdict
+    """
+    数据复核：直接展示原始数据，让用户自行核查。
+    - 每个子表单独一个标签页，完整显示数据表格
+    - 若多个子表存在同名列，额外显示"跨表对比"标签页，
+      将同名列并排展示，差异一目了然
+    """
+    sheet_names = list(sheets.keys())
 
-    with st.spinner("正在检查数据，请稍候…"):
-        issues = run_data_checks(sheets)
+    # 找出在多个子表中都出现的列名（用于跨表对比）
+    col_to_sheets: dict[str, list[str]] = {}
+    sheet_parsed: dict[str, tuple] = {}   # sn -> (date_col, value_cols, df_indexed)
+    for sn, df in sheets.items():
+        date_col, value_cols = detect_date_and_value_cols(df)
+        sheet_parsed[sn] = (date_col, value_cols or [])
+        for col in (value_cols or []):
+            col_to_sheets.setdefault(col, []).append(sn)
+    shared_cols = {col: sns for col, sns in col_to_sheets.items() if len(sns) > 1}
 
-    high   = [i for i in issues if i["level"] == "high"]
-    medium = [i for i in issues if i["level"] == "medium"]
+    # 构建标签页列表
+    tab_labels = [f"📋 {sn}" for sn in sheet_names]
+    if shared_cols:
+        tab_labels.append("🔍 跨表对比")
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("🔴 需立即核查", len(high))
-    c2.metric("🟡 建议确认",   len(medium))
-    c3.metric("共检查子表数",  len(sheets))
+    tabs = st.tabs(tab_labels)
 
-    if not issues:
-        st.success("✅ 数据看起来正常，未发现明显异常，可以直接出图。")
-        return
+    # ── 每个子表独立标签页 ──────────────────────────────────────────
+    for i, sn in enumerate(sheet_names):
+        df = sheets[sn]
+        date_col, value_cols = sheet_parsed[sn]
 
-    grouped = defaultdict(list)
-    for iss in issues:
-        grouped[iss["type"]].append(iss)
+        with tabs[i]:
+            st.caption(f"共 {len(df)} 行 · {len(df.columns)} 列")
 
-    for ptype, plist in grouped.items():
-        n_high = sum(1 for i in plist if i["level"] == "high")
-        icon   = "🔴" if n_high else "🟡"
-        with st.expander(
-            f"{icon} **{ptype}**　发现 {len(plist)} 处",
-            expanded=True,
-        ):
-            for iss in plist:
-                badge = "🔴 需立即核查" if iss["level"] == "high" else "🟡 建议确认"
-                loc   = f"子表「{iss['sheet']}」· 列「{iss['col']}」· {iss['date']}"
-                st.markdown(
-                    f"**{badge}**　{loc}\n\n"
-                    f"&nbsp;&nbsp;&nbsp;&nbsp;{iss['detail']}"
+            if not date_col:
+                # 无法识别日期列，直接展示原始表
+                st.dataframe(df, use_container_width=True, hide_index=True)
+                continue
+
+            # 整理为以日期为首列的展示格式
+            display_df = df.copy()
+            try:
+                display_df[date_col] = pd.to_datetime(
+                    display_df[date_col], errors="coerce"
+                ).dt.strftime("%Y-%m-%d")
+            except Exception:
+                pass
+
+            # 数值列保留4位有效数字，便于阅读
+            for col in value_cols:
+                try:
+                    display_df[col] = pd.to_numeric(
+                        display_df[col], errors="coerce"
+                    ).round(4)
+                except Exception:
+                    pass
+
+            st.dataframe(
+                display_df,
+                use_container_width=True,
+                hide_index=True,
+                height=min(520, (len(display_df) + 1) * 35 + 50),
+            )
+
+    # ── 跨表对比标签页 ───────────────────────────────────────────────
+    if shared_cols:
+        with tabs[-1]:
+            st.markdown(
+                "以下列名在多个子表中均有出现，已将其并排显示。"
+                "**若同一日期的数值不同，请核查数据来源是否一致。**"
+            )
+            st.markdown("---")
+
+            for col, sns in shared_cols.items():
+                st.markdown(f"#### 列：{col}　（出现在 {len(sns)} 个子表）")
+
+                # 合并：以日期为索引，各子表作为独立列
+                merged = None
+                for sn in sns:
+                    df = sheets[sn]
+                    dc, vc = sheet_parsed[sn]
+                    if not dc or col not in vc:
+                        continue
+                    sub = df[[dc, col]].copy()
+                    sub[dc] = pd.to_datetime(sub[dc], errors="coerce")
+                    sub = (
+                        sub.dropna(subset=[dc])
+                        .set_index(dc)[[col]]
+                        .rename(columns={col: sn})
+                    )
+                    sub = sub[~sub.index.duplicated(keep="first")]
+                    merged = sub if merged is None else merged.join(sub, how="outer")
+
+                if merged is None or merged.empty:
+                    st.info("无法构建对比表")
+                    continue
+
+                merged = merged.sort_index()
+                merged.index = merged.index.strftime("%Y-%m-%d")
+                merged.index.name = "日期"
+
+                # 若两列均有值，高亮数值不同的行（差异 > 0.01%）
+                def highlight_diff(row):
+                    vals = row.dropna().values
+                    if len(vals) < 2:
+                        return [""] * len(row)
+                    ref = max(abs(vals).max(), 1e-10)
+                    diff = (max(vals) - min(vals)) / ref
+                    color = "background-color: #ffe0e0" if diff > 0.001 else ""
+                    return [color] * len(row)
+
+                styled = merged.round(4).style.apply(highlight_diff, axis=1)
+                st.dataframe(
+                    styled,
+                    use_container_width=True,
+                    height=min(520, (len(merged) + 1) * 35 + 50),
                 )
-                st.divider()
-
-    st.warning(
-        f"⚠️ 共发现 {len(issues)} 处可能的数据问题"
-        f"（{len(high)} 处需立即核查 / {len(medium)} 处建议确认）。"
-        "建议先对照原始数据确认后再出图，也可以忽略直接继续。"
-    )
+                st.caption("🔴 标红行表示同一日期各子表数值存在差异")
+                st.markdown("---")
 
 
 # ── 工具函数 ────────────────────────────────────────────────────────
